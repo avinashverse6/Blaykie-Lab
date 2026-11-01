@@ -60,7 +60,6 @@ if platform == "android":
         IMPORT_ERRORS.append("storage: " + traceback.format_exc(limit=2))
 
 BLOCKS_PER_PAGE = 14
-PREVIEW_CHARS = 320
 
 
 def panel_view(height_hint=0.94):
@@ -110,6 +109,15 @@ class BlockCard(ButtonBehavior, BoxLayout):
 
     def on_release(self):
         self.on_tap()
+
+
+class ParaInput(TextInput):
+    """The paragraph box. Normal Android cut / copy / paste / delete work in it."""
+
+    def insert_text(self, substring, from_undo=False):
+        for bad in ("\r\n", "\n", "\r", "\t"):
+            substring = substring.replace(bad, " ")
+        return super().insert_text(substring, from_undo=from_undo)
 
 
 class LabApp(App):
@@ -417,8 +425,6 @@ class LabApp(App):
             text = project.block_text(block).strip()
             if kind == "table":
                 text = "[Table] " + text
-            if len(text) > PREVIEW_CHARS:
-                text = text[:PREVIEW_CHARS].rstrip() + " ..."
             card = BlockCard(text, kind, lambda b=block: self.open_block(b))
             self.cards_box.add_widget(card)
         self.page_label.text = f"{self.page + 1} / {self.page_count()}"
@@ -505,10 +511,11 @@ class LabApp(App):
         panel.add_widget(small_label(f"Paragraph {block}", color=TEXT, size=18,
                                      bold=True, height=30))
         panel.add_widget(wrapped_label(
-            "Tap where the citation should go. To replace a placeholder, "
-            "long-press the text and select it.", MUTED, 12, 44))
-        field = TextInput(
-            text=project.block_text(block), readonly=True, multiline=True,
+            "Tap where the citation should go, then press Insert citation. "
+            "You can also select text and use Android's Cut, Copy or Paste. "
+            "Blaykie never changes your text by itself.", MUTED, 12, 62))
+        field = ParaInput(
+            text=project.block_text(block), multiline=True,
             background_normal="", background_active="",
             background_color=col(SURFACE2), foreground_color=col(TEXT),
             cursor_color=col(ACCENT_TEXT), selection_color=col("#5B4BEA", 0.45),
@@ -516,51 +523,76 @@ class LabApp(App):
         )
         panel.add_widget(field)
         self.para_view, self.para_field, self.para_block = view, field, block
+        view.bind(on_dismiss=self.release_field)
 
         message = small_label("", color=ERROR, size=12, height=22)
         self.para_message = message
         panel.add_widget(message)
 
         row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        delete_btn = PillButton(text="Delete selection", style="secondary", font_size=sp(13))
-        delete_btn.bind(on_release=self.delete_selection)
+        done_btn = PillButton(text="Done", style="secondary", font_size=sp(13))
+        done_btn.bind(on_release=self.done_paragraph)
         insert_btn = PillButton(text="Insert citation", style="primary", font_size=sp(13))
         insert_btn.bind(on_release=self.insert_here)
-        row.add_widget(delete_btn)
+        row.add_widget(done_btn)
         row.add_widget(insert_btn)
         panel.add_widget(row)
-        close = PillButton(text="Close", style="ghost", size_hint_y=None, height=dp(48))
-        close.bind(on_release=lambda *a: view.dismiss())
-        panel.add_widget(close)
         view.open()
 
-    def selected_range(self):
+    def release_field(self, *args):
+        """Hide Android's selection handles and menus when the box closes."""
+        field = getattr(self, "para_field", None)
+        if field is None:
+            return
+        try:
+            field.cancel_selection()
+            field.focus = False
+            for name in ("_hide_handles", "_hide_cut_copy_paste"):
+                hide = getattr(field, name, None)
+                if hide:
+                    hide(Window)
+        except Exception:
+            pass
+
+    def sync_paragraph(self):
+        """Apply what the user did with Cut / Delete / Paste to the document.
+        Returns False (and puts the box back) if that part is protected."""
+        field = self.para_field
+        try:
+            changed = self.project.apply_text_edit(self.para_block, field.text)
+        except NotEditable as error:
+            field.text = self.project.block_text(self.para_block)
+            self.para_message.text = str(error)[:110]
+            return False
+        if changed:
+            self.save_state()
+            self.render_page()
+        self.para_message.text = ""
+        return True
+
+    def close_paragraph(self, *args):
+        self.release_field()
+        self.para_view.dismiss()
+
+    def done_paragraph(self, *args):
+        if self.sync_paragraph():
+            self.close_paragraph()
+
+    def insertion_point(self):
+        """Where the citation goes: the cursor. If some text is selected, right
+        after the selection. Nothing is ever replaced or removed."""
         field = self.para_field
         length = len(field.text)
         if field.selection_text:
-            a, b = sorted((field.selection_from, field.selection_to))
-            return max(0, a), min(length, b)
-        index = min(max(0, field.cursor_index()), length)
-        return index, index
-
-    def delete_selection(self, *args):
-        start, end = self.selected_range()
-        if start == end:
-            self.para_message.text = "Select the text to delete first."
-            return
-        try:
-            self.project.delete_range(self.para_block, start, end)
-        except NotEditable as error:
-            self.para_message.text = str(error)[:90]
-            return
-        self.para_field.text = self.project.block_text(self.para_block)
-        self.para_message.text = ""
-        self.save_state()
-        self.render_page()
+            return min(length, max(field.selection_from, field.selection_to))
+        return min(max(0, field.cursor_index()), length)
 
     def insert_here(self, *args):
-        start, end = self.selected_range()
-        self.open_citation_sheet(self.para_block, start, end)
+        position = self.insertion_point()
+        if not self.sync_paragraph():
+            return
+        position = min(position, len(self.project.block_text(self.para_block)))
+        self.open_citation_sheet(self.para_block, position, position)
 
     # ------------------------------------------------------------------
     #  choosing the Zotero reference
@@ -577,8 +609,18 @@ class LabApp(App):
         self.cite_selected = []
         self.cite_style = "parenthetical"
 
-        title = "Replace the selected text" if start != end else "Insert citation"
-        panel.add_widget(small_label(title, color=TEXT, size=17, bold=True, height=28))
+        panel.add_widget(small_label("Insert citation", color=TEXT, size=17,
+                                     bold=True, height=28))
+        text = self.project.block_text(block)
+        before = escape_markup(text[max(0, start - 36):start])
+        after = escape_markup(text[start:start + 36])
+        where = Label(
+            text=f"[color=#A3A9BC]...{before}[/color][b][color=#B9B0FF] | [/color][/b]"
+                 f"[color=#A3A9BC]{after}...[/color]",
+            markup=True, font_size=sp(12), halign="left", valign="top",
+            size_hint_y=None, height=dp(44))
+        where.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        panel.add_widget(where)
 
         row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
         box = InputBox(hint="Search your Zotero library")
@@ -720,7 +762,7 @@ class LabApp(App):
             self.cite_message.text = str(error)[:100]
             return
         self.cite_view.dismiss()
-        self.para_view.dismiss()
+        self.close_paragraph()
         self.save_state()
         self.render_page()
         self.info_label.text = "Citation added: " + self.project.citations()[-1][2][:50]
@@ -737,6 +779,9 @@ class LabApp(App):
                                      bold=True, height=32))
         lines = [f"Citations added now: {len(project.citations())}",
                  f"Blaykie references in the file: {len(project.present_keys())}"]
+        removed, added = project.edit_summary()
+        lines.append(f"Your own edits: {removed} character(s) removed, {added} added. "
+                     "Citations never remove text.")
         if project.existing_reference_headings() and not project.has_blaykie_bibliography():
             lines.append("Note: the file already has a References heading. "
                          "Blaykie adds its own list at the end.")
