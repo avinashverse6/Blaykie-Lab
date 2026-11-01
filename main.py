@@ -30,7 +30,7 @@ from ui import (
 )
 
 Window.clearcolor = col(BG)
-Window.softinput_mode = "below_target"
+Window.softinput_mode = "resize"      # the pop-ups shrink above the keyboard instead of hiding behind it
 
 IMPORT_ERRORS = []
 try:
@@ -59,7 +59,7 @@ if platform == "android":
     except Exception:
         IMPORT_ERRORS.append("storage: " + traceback.format_exc(limit=2))
 
-BLOCKS_PER_PAGE = 14
+CHUNK = 25          # paragraphs added each time you scroll near the end
 
 
 def panel_view(height_hint=0.94):
@@ -112,7 +112,8 @@ class BlockCard(ButtonBehavior, BoxLayout):
 
 
 class ParaInput(TextInput):
-    """The paragraph box. Normal Android cut / copy / paste / delete work in it."""
+    """The paragraph box. Cut / copy / paste / delete work in it. The keyboard
+    stays closed until the Keyboard button is pressed."""
 
     def insert_text(self, substring, from_undo=False):
         for bad in ("\r\n", "\n", "\r", "\t"):
@@ -129,7 +130,9 @@ class LabApp(App):
     def build(self):
         self.project = None
         self.visible = []
-        self.page = 0
+        self.cards = {}
+        self.loaded = 0
+        self.loading = False
         self.doc_name = ""
         self.shared_output = None
         self.sharer = None
@@ -349,7 +352,6 @@ class LabApp(App):
             i for i in range(project.block_count)
             if project.block_text(i).strip() or project.block_kind(i) == "table"
         ]
-        self.page = 0
         self.show_doc()
 
     # ------------------------------------------------------------------
@@ -360,16 +362,14 @@ class LabApp(App):
         root = self.root_box
         root.clear_widgets()
 
-        bar = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6),
+        bar = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8),
                         padding=[dp(10), dp(8), dp(10), 0])
         for text, handler, style in (
             ("Close", self.close_doc, "ghost"),
-            ("Outline", self.open_outline, "secondary"),
-            ("Search", self.open_search, "secondary"),
             ("Undo", self.undo, "secondary"),
             ("Export", self.open_export, "primary"),
         ):
-            button = PillButton(text=text, style=style, font_size=sp(12))
+            button = PillButton(text=text, style=style, font_size=sp(13))
             button.bind(on_release=handler)
             bar.add_widget(button)
         root.add_widget(bar)
@@ -384,52 +384,73 @@ class LabApp(App):
                                     padding=[dp(10), dp(4), dp(10), dp(12)])
         self.cards_box.bind(minimum_height=self.cards_box.setter("height"))
         scroll.add_widget(self.cards_box)
+        scroll.bind(scroll_y=self.on_scroll)
         self.cards_scroll = scroll
         root.add_widget(scroll)
+        root.add_widget(Label(size_hint_y=None, height=dp(28)))     # keeps clear of the navigation bar
 
-        pager = BoxLayout(size_hint_y=None, height=dp(92), spacing=dp(10),
-                          padding=[dp(14), dp(10), dp(14), dp(30)])
-        prev_btn = PillButton(text="Previous", style="secondary", font_size=sp(13))
-        prev_btn.bind(on_release=lambda *a: self.go_page(self.page - 1))
-        self.page_label = Label(text="", color=col(MUTED), font_size=sp(13),
-                                size_hint_x=None, width=dp(90))
-        next_btn = PillButton(text="Next", style="secondary", font_size=sp(13))
-        next_btn.bind(on_release=lambda *a: self.go_page(self.page + 1))
-        pager.add_widget(prev_btn)
-        pager.add_widget(self.page_label)
-        pager.add_widget(next_btn)
-        root.add_widget(pager)
-        self.render_page()
+        self.cards = {}
+        self.loaded = 0
+        self.loading = False
+        self.add_cards(CHUNK)
 
-    def page_count(self):
-        return max(1, -(-len(self.visible) // BLOCKS_PER_PAGE))
+    def display_text(self, block):
+        text = self.project.block_text(block).strip()
+        if self.project.block_kind(block) == "table":
+            text = "[Table] " + text
+        return text
 
-    def go_page(self, page):
-        self.page = min(max(0, page), self.page_count() - 1)
-        self.render_page()
-        self.cards_scroll.scroll_y = 1
-
-    def goto_block(self, block):
-        if block in self.visible:
-            position = self.visible.index(block)
-        else:
-            position = max((i for i, b in enumerate(self.visible) if b <= block), default=0)
-        self.go_page(position // BLOCKS_PER_PAGE)
-
-    def render_page(self):
-        project = self.project
-        self.cards_box.clear_widgets()
-        start = self.page * BLOCKS_PER_PAGE
-        for block in self.visible[start:start + BLOCKS_PER_PAGE]:
-            kind = project.block_kind(block)
-            text = project.block_text(block).strip()
-            if kind == "table":
-                text = "[Table] " + text
-            card = BlockCard(text, kind, lambda b=block: self.open_block(b))
-            self.cards_box.add_widget(card)
-        self.page_label.text = f"{self.page + 1} / {self.page_count()}"
-        cites = len(project.citations())
+    def update_info(self):
+        cites = len(self.project.citations())
         self.info_label.text = f"{self.doc_name[:34]}  |  {cites} citation(s) added"
+
+    def add_cards(self, count):
+        project = self.project
+        end = min(len(self.visible), self.loaded + count)
+        for block in self.visible[self.loaded:end]:
+            card = BlockCard(self.display_text(block), project.block_kind(block),
+                             lambda b=block: self.open_block(b))
+            self.cards[block] = card
+            self.cards_box.add_widget(card)
+        self.loaded = end
+        self.update_info()
+
+    def keep_scroll_position(self, offset):
+        def restore(dt):
+            scroll, box = self.cards_scroll, self.cards_box
+            room = max(1.0, box.height - scroll.height)
+            scroll.scroll_y = max(0.0, min(1.0, 1 - offset / room))
+            self.loading = False
+        Clock.schedule_once(restore, 0.1)
+
+    def current_offset(self):
+        scroll, box = self.cards_scroll, self.cards_box
+        return (1 - scroll.scroll_y) * max(1.0, box.height - scroll.height)
+
+    def on_scroll(self, scroll, value):
+        """Near the end of what is shown: add the next paragraphs."""
+        if value < 0.15 and self.loaded < len(self.visible) and not self.loading:
+            self.loading = True
+            offset = self.current_offset()
+            self.add_cards(CHUNK)
+            self.keep_scroll_position(offset)
+
+    def refresh_block(self, block):
+        card = self.cards.get(block)
+        if card is not None:
+            card.label.text = self.display_text(block)
+        self.update_info()
+
+    def refresh_all(self):
+        """Redraw what is shown (after Undo) and stay at the same place."""
+        self.loading = True
+        offset = self.current_offset()
+        shown = self.loaded
+        self.cards_box.clear_widgets()
+        self.cards = {}
+        self.loaded = 0
+        self.add_cards(shown)
+        self.keep_scroll_position(offset)
 
     def close_doc(self, *args):
         self.save_state()
@@ -438,65 +459,9 @@ class LabApp(App):
     def undo(self, *args):
         if self.project and self.project.undo():
             self.save_state()
-            self.render_page()
+            self.refresh_all()
         else:
             self.info_label.text = "Nothing to undo."
-
-    # ------------------------------------------------------------------
-    #  outline and search
-    # ------------------------------------------------------------------
-
-    def list_sheet(self, title, rows, on_pick, with_search=None):
-        view, panel = panel_view(0.9)
-        panel.add_widget(small_label(title, color=TEXT, size=18, bold=True, height=32))
-        holder = {}
-        if with_search:
-            box = InputBox(hint="Type a word or phrase")
-            holder["box"] = box
-            search_btn = PillButton(text="Search", style="primary",
-                                    size_hint=(None, None), size=(dp(96), dp(52)))
-            row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
-            row.add_widget(box)
-            row.add_widget(search_btn)
-            panel.add_widget(row)
-        scroll = ScrollView(bar_width=dp(3))
-        grid = GridLayout(cols=1, spacing=dp(6), size_hint_y=None)
-        grid.bind(minimum_height=grid.setter("height"))
-        scroll.add_widget(grid)
-        panel.add_widget(scroll)
-        close = PillButton(text="Close", style="ghost", size_hint_y=None, height=dp(48))
-        close.bind(on_release=lambda *a: view.dismiss())
-        panel.add_widget(close)
-
-        def fill(items):
-            grid.clear_widgets()
-            if not items:
-                grid.add_widget(wrapped_label("Nothing found.", MUTED, 13))
-            for label_text, value in items:
-                card = BlockCard(label_text, "paragraph",
-                                 lambda v=value: (view.dismiss(), on_pick(v)))
-                grid.add_widget(card)
-
-        fill(rows)
-        if with_search:
-            def run(*args):
-                fill(with_search(holder["box"].input.text))
-            search_btn.bind(on_release=run)
-            holder["box"].input.bind(on_text_validate=run)
-        view.open()
-        return view
-
-    def open_outline(self, *args):
-        rows = []
-        for block, level, text in self.project.outline():
-            rows.append((("   " * (level - 1)) + text[:90], block))
-        self.list_sheet("Outline", rows, self.goto_block)
-
-    def open_search(self, *args):
-        def run(query):
-            hits = self.project.search(query)
-            return [(f"...{snippet}...", block) for block, _at, snippet in hits[:60]]
-        self.list_sheet("Search the document", [], self.goto_block, with_search=run)
 
     # ------------------------------------------------------------------
     #  picking the spot
@@ -510,12 +475,25 @@ class LabApp(App):
         view, panel = panel_view(0.94)
         panel.add_widget(small_label(f"Paragraph {block}", color=TEXT, size=18,
                                      bold=True, height=30))
+
+        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        done_btn = PillButton(text="Done", style="secondary", font_size=sp(13))
+        done_btn.bind(on_release=self.done_paragraph)
+        self.keyboard_btn = PillButton(text="Keyboard", style="secondary", font_size=sp(13))
+        self.keyboard_btn.bind(on_release=self.toggle_keyboard)
+        insert_btn = PillButton(text="Insert citation", style="primary", font_size=sp(13))
+        insert_btn.bind(on_release=self.insert_here)
+        for widget in (done_btn, self.keyboard_btn, insert_btn):
+            row.add_widget(widget)
+        panel.add_widget(row)
+
         panel.add_widget(wrapped_label(
-            "Tap where the citation should go, then press Insert citation. "
-            "You can also select text and use Android's Cut, Copy or Paste. "
-            "Blaykie never changes your text by itself.", MUTED, 12, 62))
+            "Tap where the citation should go. Hold to select, then use "
+            "Cut, Copy or Paste. Blaykie never changes your text by itself.",
+            MUTED, 12, 46))
+
         field = ParaInput(
-            text=project.block_text(block), multiline=True,
+            text=project.block_text(block), multiline=True, keyboard_mode="managed",
             background_normal="", background_active="",
             background_color=col(SURFACE2), foreground_color=col(TEXT),
             cursor_color=col(ACCENT_TEXT), selection_color=col("#5B4BEA", 0.45),
@@ -523,29 +501,37 @@ class LabApp(App):
         )
         panel.add_widget(field)
         self.para_view, self.para_field, self.para_block = view, field, block
+        self.keyboard_on = False
         view.bind(on_dismiss=self.release_field)
 
         message = small_label("", color=ERROR, size=12, height=22)
         self.para_message = message
         panel.add_widget(message)
-
-        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        done_btn = PillButton(text="Done", style="secondary", font_size=sp(13))
-        done_btn.bind(on_release=self.done_paragraph)
-        insert_btn = PillButton(text="Insert citation", style="primary", font_size=sp(13))
-        insert_btn.bind(on_release=self.insert_here)
-        row.add_widget(done_btn)
-        row.add_widget(insert_btn)
-        panel.add_widget(row)
         view.open()
 
+    def toggle_keyboard(self, *args):
+        field = self.para_field
+        try:
+            if self.keyboard_on:
+                field.hide_keyboard()
+                self.keyboard_on = False
+                self.keyboard_btn.text = "Keyboard"
+            else:
+                field.focus = True
+                field.show_keyboard()
+                self.keyboard_on = True
+                self.keyboard_btn.text = "Hide keyboard"
+        except Exception:
+            self.para_message.text = "Could not change the keyboard."
+
     def release_field(self, *args):
-        """Hide Android's selection handles and menus when the box closes."""
+        """Hide Android's selection handles, menus and keyboard when the box closes."""
         field = getattr(self, "para_field", None)
         if field is None:
             return
         try:
             field.cancel_selection()
+            field.hide_keyboard()
             field.focus = False
             for name in ("_hide_handles", "_hide_cut_copy_paste"):
                 hide = getattr(field, name, None)
@@ -566,7 +552,7 @@ class LabApp(App):
             return False
         if changed:
             self.save_state()
-            self.render_page()
+            self.refresh_block(self.para_block)
         self.para_message.text = ""
         return True
 
@@ -764,7 +750,7 @@ class LabApp(App):
         self.cite_view.dismiss()
         self.close_paragraph()
         self.save_state()
-        self.render_page()
+        self.refresh_block(block)
         self.info_label.text = "Citation added: " + self.project.citations()[-1][2][:50]
 
     # ------------------------------------------------------------------
