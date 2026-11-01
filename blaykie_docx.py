@@ -32,6 +32,18 @@ ENTITY_RE = re.compile(r"&(#x[0-9A-Fa-f]+|#\d+|amp|lt|gt|quot|apos);")
 OBJECT_CHAR = "\ufffc"
 
 
+BOOKMARK_RE = re.compile(r'w:name="' + BOOKMARK_PREFIX + r'([A-Z0-9]+)_(\d+)"')
+
+
+class MissingReferences(Exception):
+    """The document holds Blaykie citations whose references are not loaded yet."""
+
+    def __init__(self, keys):
+        super().__init__("References for these Zotero items are needed: "
+                         + ", ".join(sorted(keys)))
+        self.keys = sorted(keys)
+
+
 class NotEditable(Exception):
     """The chosen spot is inside something Blaykie must not touch."""
 
@@ -333,6 +345,10 @@ class Para:
                 + xml[last.end:])
 
 
+def item_key(item):
+    return re.sub(r"[^A-Za-z0-9]", "", str(item.get("key") or "ITEM")).upper()[:12] or "ITEM"
+
+
 def bookmark_name(item, number):
     key = re.sub(r"[^A-Za-z0-9]", "", str(item.get("key") or "ITEM")).upper()[:12]
     return f"{BOOKMARK_PREFIX}{key or 'ITEM'}_{number}"
@@ -413,6 +429,7 @@ class DocxProject:
         self.bom = raw.startswith(b"\xef\xbb\xbf")
         self.original_xml = raw.decode("utf-8-sig")
         self.ops = []
+        self.known = {}
         self._split_body()
 
         ids = [int(i) for i in re.findall(
@@ -524,6 +541,9 @@ class DocxProject:
                 found.append(index)
         return found
 
+    def has_blaykie_bibliography(self):
+        return BIB_BOOKMARK in self.original_xml
+
     def has_zotero_fields(self):
         return bool(re.search(r"ZOTERO_ITEM|ZOTERO_BIBL|CSL_CITATION|CSL_BIBLIOGRAPHY",
                               self.original_xml))
@@ -568,6 +588,19 @@ class DocxProject:
         self._apply(op)
         self.ops.append(op)
 
+    def load_ops(self, ops):
+        """Re-apply edits saved earlier (after the app was closed)."""
+        self.ops = []
+        self._load_blocks()
+        for op in ops:
+            self._apply(op)
+            self.ops.append(op)
+        cites = [op for op in self.ops if op["type"] == "cite"]
+        if cites:
+            self.next_citation = max(self.next_citation, max(op["n"] for op in cites) + 1)
+            self.next_bookmark_id = max(
+                self.next_bookmark_id, max(max(op["bm_ids"]) for op in cites) + 1)
+
     def undo(self):
         if not self.ops:
             return False
@@ -595,7 +628,13 @@ class DocxProject:
         if op["type"] == "delete":
             if start == end:
                 return
-            block.set_xml(para.replace(start, end, ""))
+            xml = para.replace(start, end, "")
+            empty = re.compile(r'<w:bookmarkStart w:id="(\d+)" w:name="'
+                               + BOOKMARK_PREFIX + r'[A-Z0-9]+_\d+"/>'
+                               r'<w:bookmarkEnd w:id="\1"/>')
+            while empty.search(xml):
+                xml = empty.sub("", xml)
+            block.set_xml(xml)
             return
 
         rpr = para.format_source(start, end)
@@ -608,6 +647,27 @@ class DocxProject:
             pieces.append(f'<w:bookmarkEnd w:id="{bm_id}"/>')
         pieces.append(make_run(rpr, op["trail"]))
         block.set_xml(para.replace(start, end, "".join(pieces)))
+
+    # ----- references already in the document -----
+
+    def existing_keys(self):
+        """Zotero item keys of Blaykie citations found in the opened file."""
+        return sorted({m.group(1) for m in BOOKMARK_RE.finditer(self.original_xml)})
+
+    def register_items(self, items):
+        """Give Blaykie the Zotero items for citations that are already in the
+        document (fetched by key from Zotero)."""
+        for item in items:
+            self.known[item_key(item)] = item
+
+    def present_keys(self):
+        self._replay()
+        joined = "".join(b.xml for b in self.blocks)
+        return {m.group(1) for m in BOOKMARK_RE.finditer(joined)}
+
+    def missing_keys(self):
+        pool = set(self.known) | {item_key(i) for i in self.cited_items()}
+        return sorted(self.present_keys() - pool)
 
     # ----- cited references -----
 
@@ -690,10 +750,20 @@ class DocxProject:
         return out
 
     def build_xml(self, bibliography=True, heading="References", line="match",
-                  page_break=True):
-        """The final document.xml text (citations refreshed, bibliography added)."""
+                  page_break=True, allow_missing=False):
+        """The final document.xml text (citations refreshed, bibliography added).
+        The reference list contains exactly the Blaykie citations that are still
+        in the document, so citations deleted in Word drop out of it."""
         self._replay()
-        items = self.cited_items()
+        present = {m.group(1) for b in self.blocks
+                   for m in BOOKMARK_RE.finditer(b.xml)}
+        pool = dict(self.known)
+        for item in self.cited_items():
+            pool[item_key(item)] = item
+        missing = present - set(pool)
+        if missing and bibliography and not allow_missing:
+            raise MissingReferences(missing)
+        items = unique_items([pool[k] for k in sorted(present) if k in pool])
 
         # refresh citation texts so a/b suffixes are right across the paper
         xml_blocks = [b.gap + b.xml for b in self.blocks]

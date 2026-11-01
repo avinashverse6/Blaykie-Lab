@@ -268,6 +268,26 @@ def get_creators(data, kind):
     return people
 
 
+def fetch_items_by_keys(keys, user_id, api_key):
+    """Zotero items for a list of item keys (50 per request)."""
+    url = f"{API_BASE}/users/{user_id}/items"
+    headers = {
+        "Zotero-API-Key": api_key,
+        "Zotero-API-Version": "3",
+    }
+    keys = list(keys)
+    found = []
+    for start in range(0, len(keys), 50):
+        params = {
+            "itemKey": ",".join(keys[start:start + 50]),
+            "limit": 100,
+            "format": "json",
+        }
+        page, _total = fetch_page(url, headers, params)
+        found.extend(page)
+    return found
+
+
 def get_authors(data):
     return get_creators(data, "author")
 
