@@ -30,6 +30,7 @@ TAG_RE = re.compile(
 )
 ENTITY_RE = re.compile(r"&(#x[0-9A-Fa-f]+|#\d+|amp|lt|gt|quot|apos);")
 OBJECT_CHAR = "\ufffc"
+HAS_TEXT = re.compile(r"<w:t(?:\s[^>]*)?>[^<]*[^<\s][^<]*</w:t>")
 
 
 BOOKMARK_RE = re.compile(r'w:name="' + BOOKMARK_PREFIX + r'([A-Z0-9]+)_(\d+)"')
@@ -42,6 +43,12 @@ class MissingReferences(Exception):
         super().__init__("References for these Zotero items are needed: "
                          + ", ".join(sorted(keys)))
         self.keys = sorted(keys)
+
+
+# Word line spacing values: 1.5 lines = 360 * 1.5, double = 480
+SPACING_VALUES = {"1.5": 360, "double": 480, "single": 240}
+SPACING_VALUES = {k: v if k != "1.5" else 540 for k, v in SPACING_VALUES.items()}
+DEFAULT_LINE = "1.5"
 
 
 class NotEditable(Exception):
@@ -513,6 +520,19 @@ class DocxProject:
             return " | ".join(container_text(c, 0, len(c)) for c in cells)
         return container_text(block.xml, 0, len(block.xml))
 
+    def visible_blocks(self):
+        """Blocks worth showing (quick check, no full parsing)."""
+        shown = []
+        for index, block in enumerate(self.blocks):
+            if block.tag == "w:tbl":
+                shown.append(index)
+            elif block.tag == "w:p":
+                if HAS_TEXT.search(block.xml):
+                    shown.append(index)
+            elif container_text(block.xml, 0, len(block.xml)).strip():
+                shown.append(index)
+        return shown
+
     def block_kind(self, index):
         block = self.blocks[index]
         if block.tag == "w:tbl":
@@ -832,7 +852,7 @@ class DocxProject:
         out.append(f'<w:bookmarkEnd w:id="{bm_id}"/>')
         return out
 
-    def build_xml(self, bibliography=True, heading="References", line="match",
+    def build_xml(self, bibliography=True, heading="References", line="1.5",
                   page_break=True, allow_missing=False):
         """The final document.xml text (citations refreshed, bibliography added).
         The reference list contains exactly the Blaykie citations that are still
@@ -874,7 +894,9 @@ class DocxProject:
         self._split_body()
         self._load_blocks()
         try:
-            spacing = self._body_line_spacing() if line == "match" else int(line)
+            spacing = SPACING_VALUES.get(str(line), None)
+            if spacing is None:
+                spacing = int(line)
             bm_id = max(
                 [int(i) for i in re.findall(
                     r'<w:bookmarkStart\b[^>]*\bw:id="(\d+)"', joined)] + [0]) + 1
@@ -906,6 +928,12 @@ class DocxProject:
             (self.original_xml, self.prefix, self.suffix, self.body_lo,
              self.body_hi, self.blocks, self.tail_gap) = saved
         return result
+
+    def default_export_name(self):
+        import os
+        stem = os.path.splitext(os.path.basename(self.path))[0]
+        stem = re.sub(r"[^A-Za-z0-9_\- ]+", "", stem).strip().replace(" ", "_")
+        return (stem or "Document") + "_Blaykie.docx"
 
     def export(self, out_path, **options):
         if _same_file(out_path, self.path):

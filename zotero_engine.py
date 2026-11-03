@@ -1,8 +1,6 @@
 import re
 import unicodedata
 
-import requests
-
 API_BASE = "https://api.zotero.org"
 SKIP_TYPES = ("attachment", "note", "annotation")
 
@@ -15,6 +13,7 @@ PAGE_SIZE = 100     # Zotero allows at most 100 items per request
 # =====================================================================
 
 def fetch_page(url, headers, params):
+    import requests      # loaded only when needed: keeps the app start fast
     try:
         response = requests.get(
             url,
@@ -40,8 +39,10 @@ def fetch_page(url, headers, params):
     return page, response.headers.get("Total-Results", "")
 
 
-def search_zotero(query, user_id, api_key):
+def search_zotero(query, user_id, api_key, max_results=None):
     # "items/top" skips child PDFs and notes, so slots are not wasted on them
+    limit = max_results or MAX_RESULTS
+    page_size = min(PAGE_SIZE, limit)
     url = f"{API_BASE}/users/{user_id}/items/top"
     headers = {
         "Zotero-API-Key": api_key,
@@ -49,20 +50,23 @@ def search_zotero(query, user_id, api_key):
     }
 
     collected = []
+    kept = 0
     start = 0
 
-    while len(collected) < MAX_RESULTS:
+    while kept < limit:
         params = {
             "q": query,
-            "limit": PAGE_SIZE,
+            "limit": page_size,
             "start": start,
             "format": "json",
         }
         page, total = fetch_page(url, headers, params)
         collected.extend(page)
-        start += PAGE_SIZE
+        kept = sum(1 for item in collected
+                   if item.get("data", {}).get("itemType") not in SKIP_TYPES)
+        start += page_size
 
-        if len(page) < PAGE_SIZE:
+        if len(page) < page_size:
             break
         if total.isdigit() and start >= int(total):
             break
@@ -72,7 +76,7 @@ def search_zotero(query, user_id, api_key):
         item for item in collected
         if item.get("data", {}).get("itemType") not in SKIP_TYPES
     ]
-    return items[:MAX_RESULTS]
+    return items[:limit]
 
 
 # =====================================================================

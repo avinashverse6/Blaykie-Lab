@@ -5,14 +5,20 @@ insert the citation, then export a NEW .docx with the APA 7 reference list.
 The original file is never changed.
 """
 
-import json
 import os
+import time
+
+os.environ.setdefault("KIVY_NO_CONSOLELOG", "1")     # less work on a slow phone
+T_START = time.perf_counter()
+
+import json
 import shutil
 import threading
 import traceback
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
 from kivy.metrics import dp, sp
 from kivy.uix.behaviors import ButtonBehavior
@@ -22,6 +28,7 @@ from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 from kivy.utils import escape_markup, platform
 
 from ui import (
@@ -59,7 +66,32 @@ if platform == "android":
     except Exception:
         IMPORT_ERRORS.append("storage: " + traceback.format_exc(limit=2))
 
-CHUNK = 25          # paragraphs added each time you scroll near the end
+CHUNK = 10          # paragraphs drawn at a time while you scroll
+MAX_CARDS = 40      # paragraphs kept on screen at once (keeps a slow phone smooth)
+SPACING_PX = dp(8)
+SEARCH_LIMIT = 60   # references fetched per Zotero search
+SEARCH_SHOWN = 20   # references drawn at first; "Show more" adds more
+
+PERF = []           # (step, milliseconds) shown in the Speed log
+
+
+class timed:
+    """Measures one step for the Speed log on the home screen."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        self.t = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        PERF.append((self.name, (time.perf_counter() - self.t) * 1000))
+        del PERF[:-80]
+        return False
+
+
+SHEETS = []         # pop-ups that are open (for the Back button)
 
 
 def panel_view(height_hint=0.94):
@@ -69,6 +101,12 @@ def panel_view(height_hint=0.94):
         background="", background_color=(0, 0, 0, 0),
         overlay_color=(0, 0, 0, 0.75),
     )
+    try:
+        view.anim_duration = 0          # open and close at once
+    except Exception:
+        pass
+    view.bind(on_open=lambda v: SHEETS.append(v) if v not in SHEETS else None,
+              on_dismiss=lambda v: SHEETS.remove(v) if v in SHEETS else None)
     panel = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(8))
     paint(panel, SURFACE, [dp(24)] * 4, edge_hex=LINE)
     view.add_widget(panel)
@@ -142,6 +180,14 @@ class LabApp(App):
         self.state_path = os.path.join(self.user_data_dir, "state.json")
         self.config_path = os.path.join(self.user_data_dir, "credentials.json")
 
+        self._save_event = None
+        self.cards = {}
+        self.heights = {}
+        self.top_spacer = None
+        self.first = 0
+        self.loaded = 0
+        self.loading = False
+        Window.bind(on_keyboard=self.on_key)
         self.root_box = BoxLayout(orientation="vertical")
         self.build_settings()
         self.load_credentials()
@@ -149,6 +195,7 @@ class LabApp(App):
         return self.root_box
 
     def on_start(self):
+        PERF.append(("start: imports + first screen", (time.perf_counter() - T_START) * 1000))
         for message in IMPORT_ERRORS:
             self.home_status.text = "Problem: " + message[-300:]
         if platform == "android":
@@ -160,7 +207,27 @@ class LabApp(App):
                                      Permission.READ_EXTERNAL_STORAGE])
 
     def on_pause(self):
+        self.save_state()
         return True
+
+    def on_stop(self):
+        self.save_state()
+
+    def on_key(self, window, key, *args):
+        """Android Back: close the pop-up on top, then the document, then leave."""
+        if key != 27:
+            return False
+        if SHEETS:
+            top = SHEETS[-1]
+            if top is getattr(self, "para_view", None):
+                self.done_paragraph()
+            else:
+                top.dismiss()
+            return True
+        if self.project and self.screen == "doc":
+            self.close_doc()
+            return True
+        return False
 
     def on_resume(self):
         pass
@@ -235,6 +302,7 @@ class LabApp(App):
     # ------------------------------------------------------------------
 
     def show_home(self):
+        self.screen = "home"
         self.root_box.clear_widgets()
         area = BoxLayout(orientation="vertical", padding=[dp(24), dp(48), dp(24), dp(40)],
                          spacing=dp(14))
@@ -264,10 +332,34 @@ class LabApp(App):
         settings.bind(on_release=self.open_settings)
         area.add_widget(settings)
 
+        speed = PillButton(text="Speed log", style="ghost", size_hint_y=None, height=dp(44),
+                           font_size=sp(12))
+        speed.bind(on_release=self.open_speed_log)
+        area.add_widget(speed)
+
         self.home_status = wrapped_label("", MUTED, 13)
         area.add_widget(self.home_status)
         area.add_widget(Label())
         self.root_box.add_widget(area)
+
+    def open_speed_log(self, *args):
+        """How long each step took on this phone. Copy it and send it to find slow parts."""
+        view, panel = panel_view(0.85)
+        panel.add_widget(small_label("Speed log", color=TEXT, size=18, bold=True, height=30))
+        lines = [f"{ms:7.0f} ms   {name}" for name, ms in PERF] or ["Nothing recorded yet."]
+        scroll = ScrollView(bar_width=dp(3))
+        label = wrapped_label("\n".join(lines), TEXT, 12)
+        scroll.add_widget(label)
+        panel.add_widget(scroll)
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+        copy = PillButton(text="Copy", style="secondary")
+        copy.bind(on_release=lambda *a: Clipboard.copy("\n".join(lines)))
+        close = PillButton(text="Close", style="primary")
+        close.bind(on_release=lambda *a: view.dismiss())
+        row.add_widget(copy)
+        row.add_widget(close)
+        panel.add_widget(row)
+        view.open()
 
     # ------------------------------------------------------------------
     #  opening a document
@@ -311,7 +403,8 @@ class LabApp(App):
         self.doc_name = name
         self.shared_output = None
         self.save_state()
-        self.start_reading()
+        with timed("open document: first screen"):
+            self.start_reading()
 
     def read_state(self):
         try:
@@ -323,7 +416,16 @@ class LabApp(App):
             pass
         return None
 
+    def request_save(self):
+        """Save shortly after the last change instead of after every tap."""
+        if self._save_event is not None:
+            Clock.unschedule(self._save_event)
+        self._save_event = Clock.schedule_once(lambda dt: self.save_state(), 1.5)
+
     def save_state(self):
+        if self._save_event is not None:
+            Clock.unschedule(self._save_event)
+            self._save_event = None
         if not self.project:
             return
         try:
@@ -347,11 +449,8 @@ class LabApp(App):
         self.start_reading()
 
     def start_reading(self):
-        project = self.project
-        self.visible = [
-            i for i in range(project.block_count)
-            if project.block_text(i).strip() or project.block_kind(i) == "table"
-        ]
+        with timed("open document: list paragraphs"):
+            self.visible = self.project.visible_blocks()
         self.show_doc()
 
     # ------------------------------------------------------------------
@@ -359,6 +458,7 @@ class LabApp(App):
     # ------------------------------------------------------------------
 
     def show_doc(self):
+        self.screen = "doc"
         root = self.root_box
         root.clear_widgets()
 
@@ -390,6 +490,9 @@ class LabApp(App):
         root.add_widget(Label(size_hint_y=None, height=dp(28)))     # keeps clear of the navigation bar
 
         self.cards = {}
+        self.heights = {}
+        self.top_spacer = None
+        self.first = 0
         self.loaded = 0
         self.loading = False
         self.add_cards(CHUNK)
@@ -404,16 +507,70 @@ class LabApp(App):
         cites = len(self.project.citations())
         self.info_label.text = f"{self.doc_name[:34]}  |  {cites} citation(s) added"
 
+    def make_card(self, block):
+        card = BlockCard(self.display_text(block), self.project.block_kind(block),
+                         lambda b=block: self.open_block(b))
+        card.block = block
+        return card
+
     def add_cards(self, count):
-        project = self.project
+        """Draw the next paragraphs at the bottom."""
         end = min(len(self.visible), self.loaded + count)
-        for block in self.visible[self.loaded:end]:
-            card = BlockCard(self.display_text(block), project.block_kind(block),
-                             lambda b=block: self.open_block(b))
+        with timed(f"draw {end - self.loaded} paragraphs"):
+            for block in self.visible[self.loaded:end]:
+                card = self.make_card(block)
+                self.cards[block] = card
+                self.cards_box.add_widget(card)
+        self.loaded = end
+        self.trim_top()
+        self.update_info()
+
+    def trim_top(self):
+        """Keep only MAX_CARDS paragraphs alive. Paragraphs far above are
+        replaced by empty space of the same height."""
+        while self.loaded - self.first > MAX_CARDS:
+            block = self.visible[self.first]
+            card = self.cards.pop(block, None)
+            if card is None:
+                break
+            self.heights[block] = card.height
+            self.cards_box.remove_widget(card)
+            if self.top_spacer is None:
+                self.top_spacer = Widget(size_hint_y=None, height=card.height)
+                self.cards_box.add_widget(self.top_spacer,
+                                          index=len(self.cards_box.children))
+            else:
+                self.top_spacer.height += card.height + SPACING_PX
+            self.first += 1
+
+    def draw_window(self, first, end):
+        """Redraw paragraphs first..end with empty space above them."""
+        self.cards_box.clear_widgets()
+        self.cards = {}
+        self.top_spacer = None
+        if first > 0:
+            total = sum(self.heights.get(b, dp(60)) + SPACING_PX
+                        for b in self.visible[:first]) - SPACING_PX
+            self.top_spacer = Widget(size_hint_y=None, height=max(0, total))
+            self.cards_box.add_widget(self.top_spacer)
+        for block in self.visible[first:end]:
+            card = self.make_card(block)
             self.cards[block] = card
             self.cards_box.add_widget(card)
-        self.loaded = end
+        self.first, self.loaded = first, end
         self.update_info()
+
+    def show_above(self):
+        """Scrolled back up to the top of what is drawn: bring back earlier paragraphs."""
+        self.loading = True
+        offset = self.current_offset()
+        for block, card in self.cards.items():
+            self.heights[block] = card.height
+        new_first = max(0, self.first - CHUNK)
+        new_end = min(self.loaded, new_first + MAX_CARDS)
+        with timed("redraw earlier paragraphs"):
+            self.draw_window(new_first, new_end)
+        self.keep_scroll_position(offset)
 
     def keep_scroll_position(self, offset):
         def restore(dt):
@@ -428,12 +585,16 @@ class LabApp(App):
         return (1 - scroll.scroll_y) * max(1.0, box.height - scroll.height)
 
     def on_scroll(self, scroll, value):
-        """Near the end of what is shown: add the next paragraphs."""
-        if value < 0.15 and self.loaded < len(self.visible) and not self.loading:
+        """Near the end: draw more below. Near the top: bring back earlier ones."""
+        if self.loading:
+            return
+        if value < 0.15 and self.loaded < len(self.visible):
             self.loading = True
             offset = self.current_offset()
             self.add_cards(CHUNK)
             self.keep_scroll_position(offset)
+        elif value > 0.85 and self.first > 0:
+            self.show_above()
 
     def refresh_block(self, block):
         card = self.cards.get(block)
@@ -442,15 +603,11 @@ class LabApp(App):
         self.update_info()
 
     def refresh_all(self):
-        """Redraw what is shown (after Undo) and stay at the same place."""
-        self.loading = True
-        offset = self.current_offset()
-        shown = self.loaded
-        self.cards_box.clear_widgets()
-        self.cards = {}
-        self.loaded = 0
-        self.add_cards(shown)
-        self.keep_scroll_position(offset)
+        """After Undo: update the text of what is drawn, nothing is rebuilt."""
+        with timed("refresh after undo"):
+            for block, card in self.cards.items():
+                card.label.text = self.display_text(block)
+        self.update_info()
 
     def close_doc(self, *args):
         self.save_state()
@@ -458,7 +615,7 @@ class LabApp(App):
 
     def undo(self, *args):
         if self.project and self.project.undo():
-            self.save_state()
+            self.request_save()
             self.refresh_all()
         else:
             self.info_label.text = "Nothing to undo."
@@ -468,6 +625,10 @@ class LabApp(App):
     # ------------------------------------------------------------------
 
     def open_block(self, block):
+        with timed("open paragraph box"):
+            self.build_paragraph_box(block)
+
+    def build_paragraph_box(self, block):
         project = self.project
         if not project.block_editable(block):
             self.info_label.text = "Tables and special blocks cannot be edited."
@@ -551,7 +712,7 @@ class LabApp(App):
             self.para_message.text = str(error)[:110]
             return False
         if changed:
-            self.save_state()
+            self.request_save()
             self.refresh_block(self.para_block)
         self.para_message.text = ""
         return True
@@ -689,29 +850,55 @@ class LabApp(App):
         self.cite_grid.clear_widgets()
         self.cite_results, self.cite_selected = [], []
         self.run_background(
-            lambda: search_zotero(query, creds[0], creds[1]),
+            lambda: search_zotero(query, creds[0], creds[1], max_results=SEARCH_LIMIT),
             self.show_cite_results,
             lambda message: setattr(self.cite_status, "text", message))
 
     def show_cite_results(self, results):
         self.cite_results = results
+        self.cite_drawn = 0
+        self.more_button = None
         self.cite_status.text = f"{len(results)} result(s)" if results else "No references found."
-        for number, item in enumerate(results):
-            data = item.get("data", {})
-            authors = get_authors(data)
-            if not authors:
-                who = "Unknown author"
-            elif len(authors) == 1:
-                who = authors[0]["last"]
-            elif len(authors) == 2:
-                who = f"{authors[0]['last']} & {authors[1]['last']}"
-            else:
-                who = f"{authors[0]['last']} et al."
-            title = (data.get("title") or "[No title]")[:100]
-            text = (f"[size=14sp][color=#F3F4F8][b]{escape_markup(who)} \u00b7 "
-                    f"{escape_markup(get_year(data))}[/b][/color][/size]\n{escape_markup(title)}")
-            card = ResultCard(text, lambda sel, n=number: self.toggle_item(n, sel))
-            self.cite_grid.add_widget(card)
+        self.draw_more_results()
+
+    def result_card(self, number):
+        item = self.cite_results[number]
+        data = item.get("data", {})
+        authors = get_authors(data)
+        if not authors:
+            who = "Unknown author"
+        elif len(authors) == 1:
+            who = authors[0]["last"]
+        elif len(authors) == 2:
+            who = f"{authors[0]['last']} & {authors[1]['last']}"
+        else:
+            who = f"{authors[0]['last']} et al."
+        title = (data.get("title") or "[No title]")[:100]
+        text = (f"[size=14sp][color=#F3F4F8][b]{escape_markup(who)} \u00b7 "
+                f"{escape_markup(get_year(data))}[/b][/color][/size]\n{escape_markup(title)}")
+        card = ResultCard(text, lambda sel, n=number: self.toggle_item(n, sel))
+        if number in self.cite_selected:
+            card.set_selected(True, notify=False)
+        return card
+
+    def draw_more_results(self, *args):
+        """Draw the next few results (a long list at once is slow on a small phone)."""
+        grid = self.cite_grid
+        if self.more_button is not None:
+            grid.remove_widget(self.more_button)
+            self.more_button = None
+        end = min(len(self.cite_results), self.cite_drawn + SEARCH_SHOWN)
+        with timed(f"draw {end - self.cite_drawn} search results"):
+            for number in range(self.cite_drawn, end):
+                grid.add_widget(self.result_card(number))
+        self.cite_drawn = end
+        left = len(self.cite_results) - end
+        if left > 0:
+            button = PillButton(text=f"Show more ({left})", style="secondary",
+                                size_hint_y=None, height=dp(48))
+            button.bind(on_release=self.draw_more_results)
+            self.more_button = button
+            grid.add_widget(button)
 
     def toggle_item(self, number, selected):
         if selected and number not in self.cite_selected:
@@ -735,6 +922,10 @@ class LabApp(App):
         self.cite_preview.text = "Will insert:  " + text
 
     def confirm_insert(self, *args):
+        with timed("insert citation"):
+            self.do_insert()
+
+    def do_insert(self):
         items = self.chosen_items()
         if not items:
             self.cite_message.text = "Select a reference first."
@@ -749,7 +940,7 @@ class LabApp(App):
             return
         self.cite_view.dismiss()
         self.close_paragraph()
-        self.save_state()
+        self.request_save()
         self.refresh_block(block)
         self.info_label.text = "Citation added: " + self.project.citations()[-1][2][:50]
 
@@ -776,6 +967,17 @@ class LabApp(App):
         if project.has_zotero_fields():
             lines.append("Zotero plugin citations are left untouched.")
         panel.add_widget(wrapped_label("\n".join(lines), TEXT, 13, 120))
+        panel.add_widget(small_label("References line spacing", bold=True))
+        spacing_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        self.spacing_choice = "1.5"
+        self.spacing_buttons = {}
+        for value, text in (("1.5", "1.5 lines (your document)"), ("double", "Double (APA)")):
+            button = PillButton(text=text, font_size=sp(12),
+                                style="primary" if value == self.spacing_choice else "secondary")
+            button.bind(on_release=lambda *a, v=value: self.set_spacing(v))
+            self.spacing_buttons[value] = button
+            spacing_row.add_widget(button)
+        panel.add_widget(spacing_row)
         self.export_status = wrapped_label("", ACCENT_TEXT, 13, 80)
         panel.add_widget(self.export_status)
         panel.add_widget(Label())
@@ -792,6 +994,12 @@ class LabApp(App):
         close.bind(on_release=lambda *a: view.dismiss())
         panel.add_widget(close)
         view.open()
+
+    def set_spacing(self, value):
+        self.spacing_choice = value
+        for name, button in self.spacing_buttons.items():
+            button.style = "primary" if name == value else "secondary"
+            button.redraw()
 
     def run_export(self, *args, allow_missing=False):
         project = self.project
@@ -821,14 +1029,19 @@ class LabApp(App):
         self.finish_export(False)
 
     def finish_export(self, allow_missing):
+        with timed("export"):
+            self.do_export(allow_missing)
+
+    def do_export(self, allow_missing):
         try:
-            stem = os.path.splitext(self.doc_name)[0]
-            out = os.path.join(self.user_data_dir, stem + "_Blaykie.docx")
-            self.project.export(out, allow_missing=allow_missing)
+            out = os.path.join(self.user_data_dir, self.project.default_export_name())
+            self.project.export(out, allow_missing=allow_missing,
+                                line=getattr(self, "spacing_choice", "1.5"))
             text = f"Exported ({os.path.getsize(out) // 1024} KB)."
             if SharedStorage:
                 self.shared_output = SharedStorage().copy_to_shared(out)
-                text += " Saved to your Documents/Downloads. Tap Share / open to view it."
+                text += (f" Saved as {self.project.default_export_name()}. "
+                         "Tap Share / open, then open it in OnlyOffice.")
                 self.share_btn.disabled = False
                 self.share_btn.redraw()
             self.export_status.text = text
