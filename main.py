@@ -28,7 +28,6 @@ from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
-from kivy.uix.widget import Widget
 from kivy.utils import escape_markup, platform
 
 from ui import (
@@ -67,8 +66,6 @@ if platform == "android":
         IMPORT_ERRORS.append("storage: " + traceback.format_exc(limit=2))
 
 CHUNK = 10          # paragraphs drawn at a time while you scroll
-MAX_CARDS = 40      # paragraphs kept on screen at once (keeps a slow phone smooth)
-SPACING_PX = dp(8)
 SEARCH_LIMIT = 60   # references fetched per Zotero search
 SEARCH_SHOWN = 20   # references drawn at first; "Show more" adds more
 
@@ -182,9 +179,6 @@ class LabApp(App):
 
         self._save_event = None
         self.cards = {}
-        self.heights = {}
-        self.top_spacer = None
-        self.first = 0
         self.loaded = 0
         self.loading = False
         Window.bind(on_keyboard=self.on_key)
@@ -490,12 +484,10 @@ class LabApp(App):
         root.add_widget(Label(size_hint_y=None, height=dp(28)))     # keeps clear of the navigation bar
 
         self.cards = {}
-        self.heights = {}
-        self.top_spacer = None
-        self.first = 0
         self.loaded = 0
         self.loading = False
         self.add_cards(CHUNK)
+        Clock.schedule_once(self.fill_screen, 0.4)
 
     def display_text(self, block):
         text = self.project.block_text(block).strip()
@@ -522,79 +514,49 @@ class LabApp(App):
                 self.cards[block] = card
                 self.cards_box.add_widget(card)
         self.loaded = end
-        self.trim_top()
         self.update_info()
-
-    def trim_top(self):
-        """Keep only MAX_CARDS paragraphs alive. Paragraphs far above are
-        replaced by empty space of the same height."""
-        while self.loaded - self.first > MAX_CARDS:
-            block = self.visible[self.first]
-            card = self.cards.pop(block, None)
-            if card is None:
-                break
-            self.heights[block] = card.height
-            self.cards_box.remove_widget(card)
-            if self.top_spacer is None:
-                self.top_spacer = Widget(size_hint_y=None, height=card.height)
-                self.cards_box.add_widget(self.top_spacer,
-                                          index=len(self.cards_box.children))
-            else:
-                self.top_spacer.height += card.height + SPACING_PX
-            self.first += 1
-
-    def draw_window(self, first, end):
-        """Redraw paragraphs first..end with empty space above them."""
-        self.cards_box.clear_widgets()
-        self.cards = {}
-        self.top_spacer = None
-        if first > 0:
-            total = sum(self.heights.get(b, dp(60)) + SPACING_PX
-                        for b in self.visible[:first]) - SPACING_PX
-            self.top_spacer = Widget(size_hint_y=None, height=max(0, total))
-            self.cards_box.add_widget(self.top_spacer)
-        for block in self.visible[first:end]:
-            card = self.make_card(block)
-            self.cards[block] = card
-            self.cards_box.add_widget(card)
-        self.first, self.loaded = first, end
-        self.update_info()
-
-    def show_above(self):
-        """Scrolled back up to the top of what is drawn: bring back earlier paragraphs."""
-        self.loading = True
-        offset = self.current_offset()
-        for block, card in self.cards.items():
-            self.heights[block] = card.height
-        new_first = max(0, self.first - CHUNK)
-        new_end = min(self.loaded, new_first + MAX_CARDS)
-        with timed("redraw earlier paragraphs"):
-            self.draw_window(new_first, new_end)
-        self.keep_scroll_position(offset)
-
-    def keep_scroll_position(self, offset):
-        def restore(dt):
-            scroll, box = self.cards_scroll, self.cards_box
-            room = max(1.0, box.height - scroll.height)
-            scroll.scroll_y = max(0.0, min(1.0, 1 - offset / room))
-            self.loading = False
-        Clock.schedule_once(restore, 0.1)
 
     def current_offset(self):
         scroll, box = self.cards_scroll, self.cards_box
         return (1 - scroll.scroll_y) * max(1.0, box.height - scroll.height)
 
+    def keep_scroll_position(self, offset):
+        """More paragraphs were added below: stay on the same paragraph. On a
+        slow phone the new paragraphs measure themselves a little later, so
+        check again until the height stops changing."""
+        state = {"tries": 0, "last": -1}
+
+        def restore(dt):
+            scroll, box = self.cards_scroll, self.cards_box
+            room = max(1.0, box.height - scroll.height)
+            scroll.scroll_y = max(0.0, min(1.0, 1 - offset / room))
+            state["tries"] += 1
+            if box.height != state["last"] and state["tries"] < 8:
+                state["last"] = box.height
+                Clock.schedule_once(restore, 0.1)
+            else:
+                self.loading = False
+
+        Clock.schedule_once(restore, 0.1)
+
     def on_scroll(self, scroll, value):
-        """Near the end: draw more below. Near the top: bring back earlier ones."""
-        if self.loading:
+        """About a screen or two from the end: draw the next paragraphs."""
+        if self.loading or self.loaded >= len(self.visible):
             return
-        if value < 0.15 and self.loaded < len(self.visible):
+        room = max(1.0, self.cards_box.height - scroll.height)
+        if value * room < dp(1000):                 # pixels still below the screen
             self.loading = True
             offset = self.current_offset()
             self.add_cards(CHUNK)
             self.keep_scroll_position(offset)
-        elif value > 0.85 and self.first > 0:
-            self.show_above()
+
+    def fill_screen(self, dt):
+        """A short document must still fill the screen."""
+        if self.screen != "doc" or self.loaded >= len(self.visible):
+            return
+        if self.cards_box.height <= self.cards_scroll.height * 1.5:
+            self.add_cards(CHUNK)
+            Clock.schedule_once(self.fill_screen, 0.4)
 
     def refresh_block(self, block):
         card = self.cards.get(block)
