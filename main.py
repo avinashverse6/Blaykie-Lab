@@ -931,9 +931,10 @@ class LabApp(App):
         panel.add_widget(wrapped_label("\n".join(lines), TEXT, 13, 120))
         panel.add_widget(small_label("References line spacing", bold=True))
         spacing_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        self.spacing_choice = "1.5"
+        self.spacing_choice = "match"
         self.spacing_buttons = {}
-        for value, text in (("1.5", "1.5 lines (your document)"), ("double", "Double (APA)")):
+        for value, text in (("match", "Like my document"), ("1.5", "1.5 lines"),
+                            ("double", "Double (APA)")):
             button = PillButton(text=text, font_size=sp(12),
                                 style="primary" if value == self.spacing_choice else "secondary")
             button.bind(on_release=lambda *a, v=value: self.set_spacing(v))
@@ -998,7 +999,7 @@ class LabApp(App):
         try:
             out = os.path.join(self.user_data_dir, self.project.default_export_name())
             self.project.export(out, allow_missing=allow_missing,
-                                line=getattr(self, "spacing_choice", "1.5"))
+                                line=getattr(self, "spacing_choice", "match"))
             text = f"Exported ({os.path.getsize(out) // 1024} KB)."
             if SharedStorage:
                 self.shared_output = SharedStorage().copy_to_shared(out)

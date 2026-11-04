@@ -45,10 +45,10 @@ class MissingReferences(Exception):
         self.keys = sorted(keys)
 
 
-# Word line spacing values: 1.5 lines = 360 * 1.5, double = 480
-SPACING_VALUES = {"1.5": 360, "double": 480, "single": 240}
-SPACING_VALUES = {k: v if k != "1.5" else 540 for k, v in SPACING_VALUES.items()}
-DEFAULT_LINE = "1.5"
+# Word measures line spacing in 240ths of a line:
+# 240 = single, 360 = 1.5 lines, 480 = double
+SPACING_VALUES = {"single": 240, "1.5": 360, "double": 480}
+DEFAULT_LINE = "match"          # same spacing as the body text of the document
 
 
 class NotEditable(Exception):
@@ -826,7 +826,7 @@ class DocxProject:
                 values.append(int(match.group(1)))
         if values:
             return Counter(values).most_common(1)[0][0]
-        return 480
+        return 240
 
     def _bibliography_xml(self, items, line, heading, page_break, bm_id):
         fonts, size = self._base_run_format()
@@ -852,7 +852,7 @@ class DocxProject:
         out.append(f'<w:bookmarkEnd w:id="{bm_id}"/>')
         return out
 
-    def build_xml(self, bibliography=True, heading="References", line="1.5",
+    def build_xml(self, bibliography=True, heading="References", line="match",
                   page_break=True, allow_missing=False):
         """The final document.xml text (citations refreshed, bibliography added).
         The reference list contains exactly the Blaykie citations that are still
@@ -894,9 +894,12 @@ class DocxProject:
         self._split_body()
         self._load_blocks()
         try:
-            spacing = SPACING_VALUES.get(str(line), None)
-            if spacing is None:
-                spacing = int(line)
+            if line == "match":
+                spacing = self._body_line_spacing()
+            else:
+                spacing = SPACING_VALUES.get(str(line))
+                if spacing is None:
+                    spacing = int(line)
             bm_id = max(
                 [int(i) for i in re.findall(
                     r'<w:bookmarkStart\b[^>]*\bw:id="(\d+)"', joined)] + [0]) + 1
